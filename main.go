@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,10 +9,56 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ak-er/golang-playground/env"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// setup redis in project
+var redisClient *redis.Client
+var ctx = context.Background()
+
+func initRedis() {
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	// check connection
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect redis:: %v", err)
+	}
+	log.Println("connected to redis")
+}
+
+// token blacklist function
+func blacklistToken(token string, expiration time.Duration) error {
+	if redisClient == nil {
+		return fmt.Errorf("redis client not initialized")
+	}
+	err := redisClient.Set(ctx, token, "blacklisted", expiration).Err()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// check blacklisted token
+func isTokenBlackListed(token string) (bool, error) {
+	if redisClient == nil {
+		return false, fmt.Errorf("redis client not initialized")
+	}
+	exists, err := redisClient.Exists(ctx, token).Result()
+	if err != nil {
+		return false, err
+	}
+	return exists > 0, nil
+}
 
 // Helper function to hash password
 func hashPassword(password string) (string, error) {
@@ -48,9 +95,6 @@ func init() {
 	}
 }
 
-// Secret key for signin using JWT token
-var jwtSecret = []byte("my-secret-key")
-
 // user struct for authentication
 type User struct {
 	Username string `json:"username"`
@@ -66,7 +110,7 @@ func generateToken(username, role string) (string, string, error) {
 	}
 	// access-token short lived
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, tokenClaim)
-	accessTokenString, err := accessToken.SignedString(jwtSecret)
+	accessTokenString, err := accessToken.SignedString(env.GetJWTSecret())
 	if err != nil {
 		return "", "", err
 	}
@@ -77,7 +121,7 @@ func generateToken(username, role string) (string, string, error) {
 		"exp":      time.Now().Add(time.Hour * 24 * 7).Unix(), // expiration time 7 days
 	}
 	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
-	refreshTokenString, err := refreshToken.SignedString(jwtSecret)
+	refreshTokenString, err := refreshToken.SignedString(env.GetJWTSecret())
 	if err != nil {
 		return "", "", err
 	}
@@ -99,11 +143,20 @@ func authenticate(allowRoles ...string) func(http.HandlerFunc) http.HandlerFunc 
 				return
 			}
 			tokenString := authHeader[len(prefix):]
+			isBlackListed, err := isTokenBlackListed(tokenString)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("error checking token blacklist: %v", err), http.StatusInternalServerError)
+				return
+			}
+			if isBlackListed {
+				http.Error(w, "token-blacklisted", http.StatusBadRequest)
+				return
+			}
 			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 					return nil, fmt.Errorf("unexpected signin method")
 				}
-				return jwtSecret, nil
+				return env.GetJWTSecret(), nil
 			})
 			if err != nil || !token.Valid {
 				http.Error(w, "Invalid token", http.StatusUnauthorized)
@@ -164,6 +217,157 @@ func login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// registration endpoint
+func register(w http.ResponseWriter, r *http.Request) {
+	var user User
+	err := json.NewDecoder(r.Body).Decode(&user)
+	if err != nil || user.Username == "" || user.Password == "" {
+		http.Error(w, "invalid credentials", http.StatusBadRequest)
+		return
+	}
+	// hash password
+	hashPassword, err := hashPassword(user.Password)
+	if err != nil {
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+	_, err = db.Exec(
+		`INSERT INTO users (username, password, role) VALUES (?, ?, ?)`,
+		user.Username, hashPassword, "user")
+	if err != nil {
+		http.Error(w, "user already exists", http.StatusConflict)
+		return
+	}
+	log.Printf("user: user-regstration successfully - %v", user.Username)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "user registred successfully",
+	})
+}
+
+// request password reset
+func requestPasswordReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Username string `json:"username"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&body)
+	if err != nil || body.Username == "" {
+		http.Error(w, "invalid credentials", http.StatusBadRequest)
+		return
+	}
+
+	// claim reset-token
+	resetTokenClaim := jwt.MapClaims{
+		"username": body.Username,
+		"exp":      time.Now().Add(time.Minute * 5).Unix(),
+	}
+	resetToken := jwt.NewWithClaims(jwt.SigningMethodHS256, resetTokenClaim)
+	token, err := resetToken.SignedString(env.GetJWTSecret())
+	if err != nil {
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("request reset-password successfully execute:- %v", body.Username)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"reset-token": token})
+}
+
+// reset password
+func resetPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		NewPassword string `json:"new-password"`
+		ResetToken  string `json:"reset-token"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&body)
+	if err != nil || body.NewPassword == "" || body.ResetToken == "" {
+		http.Error(w, "invalid reset-token or all field is required", http.StatusBadRequest)
+		return
+	}
+	// token parse and validate
+	token, err := jwt.Parse(body.ResetToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			log.Println("token.Method", token.Method)
+			return nil, fmt.Errorf("unexpected string")
+		}
+		return env.GetJWTSecret(), nil
+	})
+	log.Println(err)
+	if err != nil || !token.Valid {
+		http.Error(w, "invalid or expired reset token", http.StatusUnauthorized)
+		return
+	}
+	// token claim
+	claims, _ := token.Claims.(jwt.MapClaims)
+	username := claims["username"].(string)
+
+	hashPassword, err := hashPassword(body.NewPassword)
+	if err != nil {
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+	_, err = db.Exec(`UPDATE users SET password=? WHERE username=?`, hashPassword, username)
+	if err != nil {
+		http.Error(w, "failed to set new password", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "password successfully reset",
+	})
+}
+
+// logout
+func logout(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "token missing", http.StatusBadRequest)
+		return
+	}
+	prefix := "Bearer "
+	if authHeader == "" {
+		http.Error(w, "Authorization header is Required", http.StatusUnauthorized)
+		return
+	}
+	if len(authHeader) <= len(prefix) {
+		http.Error(w, "invalid authorization header: token missing", http.StatusBadRequest)
+		return
+	}
+	tokenString := authHeader[len(prefix):]
+	// extract expiration from token
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			log.Println("token.Method", token.Method)
+			return nil, fmt.Errorf("unexpected string")
+		}
+		return env.GetJWTSecret(), nil
+	})
+	log.Println(err)
+	if err != nil || !token.Valid {
+		http.Error(w, "invalid or expired reset token", http.StatusUnauthorized)
+		return
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	exp := int64(claims["exp"].(float64))
+	now := time.Now().Unix()
+	if exp <= now {
+		http.Error(w, "token already expired", http.StatusUnauthorized)
+		return
+	}
+	err = blacklistToken(tokenString, time.Until(time.Unix(10, 10)))
+	if err != nil {
+		http.Error(w, "failed to blacklist token", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Logged out successfully"})
+}
+
 // implement refresh-token endpoint
 func refreshTokenEndpoint(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -174,13 +378,21 @@ func refreshTokenEndpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid refresh token", http.StatusBadRequest)
 		return
 	}
-
+	isBlackListed, err := isTokenBlackListed(body.RefreshToken)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error checking token blacklist: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if isBlackListed {
+		http.Error(w, "token-blacklisted", http.StatusBadRequest)
+		return
+	}
 	token, err := jwt.Parse(body.RefreshToken, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			log.Println("token.Method", token.Method)
 			return nil, fmt.Errorf("unexpected string method")
 		}
-		return jwtSecret, nil
+		return env.GetJWTSecret(), nil
 	})
 	if err != nil || !token.Valid {
 		http.Error(w, "invalid or expired refresh token", http.StatusUnauthorized)
@@ -230,14 +442,23 @@ func adminProtectedEndpoint(w http.ResponseWriter, r *http.Request) {
 const PORT = ":8080"
 
 func main() {
+	initRedis()
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
+	}
 	// routes
 	http.HandleFunc("/login", login)
+	http.HandleFunc("/register", register)
+	http.HandleFunc("/request-reset-password", requestPasswordReset)
+	http.HandleFunc("/reset-password", resetPassword)
 	http.HandleFunc("/user-protected-endpoint", authenticate("admin", "user")(userProtectedEndpoint))
 	http.HandleFunc("/admin-protected-endpoint", authenticate("admin")(adminProtectedEndpoint))
 	http.HandleFunc("/refresh-token", refreshTokenEndpoint)
+	http.HandleFunc("/logout", logout)
 	// starting server
 	fmt.Printf("Server is starting at http::/127.0.0.1:%s\n", PORT)
-	err := http.ListenAndServe(PORT, nil)
+	err = http.ListenAndServe(PORT, nil)
 	if err != nil {
 		fmt.Println("Error Occur while server", err)
 	}
