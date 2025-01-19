@@ -1,0 +1,12 @@
+{"level":"info","msg":"Logger Initialized","time":"2025-01-19T13:18:11+05:30"}
+{"level":"info","msg":"Logger Initialized","time":"2025-01-19T13:18:57+05:30"}
+{"ip":"127.0.0.1:40982","level":"info","method":"GET","msg":"Request Received","time":"2025-01-19T13:19:29+05:30","url":"/"}
+{"ip":"127.0.0.1:40982","level":"info","method":"GET","msg":"Request Received","time":"2025-01-19T13:19:45+05:30","url":"/"}
+{"level":"info","msg":"Logger Initialized","time":"2025-01-19T13:27:46+05:30"}
+{"ip":"127.0.0.1:32848","level":"info","method":"POST","msg":"Request Received","time":"2025-01-19T13:27:49+05:30","url":"/"}
+{"ip":"127.0.0.1:40848","level":"info","method":"POST","msg":"Request Received","time":"2025-01-19T13:31:24+05:30","url":"/error"}
+{"level":"info","msg":"Logger Initialized","time":"2025-01-19T13:31:29+05:30"}
+{"error":"example error","ip":"127.0.0.1:40852","level":"error","method":"POST","msg":"Error Occured","time":"2025-01-19T13:31:33+05:30","url":"/error"}
+{"level":"info","msg":"Logger Initialized","time":"2025-01-19T13:36:17+05:30"}
+{"error":"example error","ip":"127.0.0.1:53682","level":"error","method":"POST","msg":"Error Occured","time":"2025-01-19T13:36:26+05:30","url":"/error"}
+{"ip":"127.0.0.1:53682","level":"info","method":"GET","msg":"Request Received","time":"2025-01-19T13:36:39+05:30","url":"/"}
