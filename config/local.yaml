@@ -1,0 +1,4 @@
+env: "dev"
+database: "storage/storage.db"
+http_server:
+  address: "127.0.0.1:8080"
